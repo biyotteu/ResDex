@@ -178,6 +178,9 @@ class Residual:
         current_obs = self.vec_env.reset()
         current_states = self.vec_env.get_state()
 
+        # ------------------------------------------------------------
+        # Testing / Evaluation
+        # ------------------------------------------------------------  
         if self.is_testing and  self.save_test_traj:
             residual_actions_list = []                      
             for _ in range(200):
@@ -204,42 +207,46 @@ class Residual:
                                     "object_scale_buf":self.vec_env.task.object_scale_buf}
                     torch.save(data_dict, "trajectory.pt")
             print("success_rate:",success_rate.item())
-            exit()
-        elif self.is_testing and not self.save_test_traj: 
-            # force_record = []
-            for _ in range(200):
-                with torch.no_grad():
-                    if self.apply_reset:
-                        current_obs = self.vec_env.reset()
-                    id = (id+1)%self.vec_env.task.max_episode_length
-                    # Compute the action
-                    base_actions = self.get_base_actions(self.get_obs(current_obs, model="base"))
-                    residual_obs = self.get_full_residual_obs(self.get_obs(current_obs, model="base"), base_actions, self.get_obs(current_obs, model="residual"))
-                    # save the force sensor in the first environment
-                    # force_record.append(self.vec_env.task.vec_sensor_tensor[0,:30].clone())
-                    residual_actions = self.actor_critic.act_inference(residual_obs)
-                    actions = self.compose_actions(base_actions, residual_actions)
-                    # Step the vec_environment
-                    next_obs, rews, dones, infos = self.vec_env.step(actions, id)
-                    current_obs.copy_(next_obs)
-                if _ == 200-2:
-                    success_rate=self.vec_env.task.successes.sum()/self.vec_env.num_envs
-            
-            print("success_rate:",success_rate.item())
-            # print("force_record:",force_record)
-            # copy tensor to cpu first  
-            # for i in range(len(force_record)):
-            #     force_record[i] = force_record[i].cpu().numpy()
-            # force_record = np.array(force_record)
-            # for i in range(5):
-            #     # compute the force norm for every finger
-            #     # force_norm = np.max(force_record[:,i*6:i*6+6],axis=1)
-            #     force_norm = np.linalg.norm(force_record[:,i*6:i*6+6],axis=1)
-            #     plt.plot(range(len(force_norm)),force_norm)
-            # plt.ylim(0,0.5)
-            # # plt.legend()
-            # plt.show()
-            exit()
+            # Return per-env success (0/1) so caller can still proceed if needed.
+            return self.vec_env.task.successes.clone()
+
+        elif self.is_testing and (not self.save_test_traj):
+            # Evaluate for num_learning_iterations episodes.
+            # Return success_counts per env so test.py can aggregate per-object YAML.
+            success_counts = torch.zeros(self.vec_env.num_envs, dtype=torch.float, device=self.device)
+
+            for ep in range(num_learning_iterations):
+                id = -1
+                # Roll one full episode (the task uses max_episode_length termination)
+                for t in range(self.vec_env.task.max_episode_length):
+                    with torch.no_grad():
+                        if self.apply_reset and t == 0:
+                            current_obs = self.vec_env.reset()
+                            current_states = self.vec_env.get_state()
+                        id = (id + 1) % self.vec_env.task.max_episode_length
+
+                        base_actions = self.get_base_actions(self.get_obs(current_obs, model="base"))
+                        residual_obs = self.get_full_residual_obs(
+                            self.get_obs(current_obs, model="base"),
+                            base_actions,
+                            self.get_obs(current_obs, model="residual"),
+                        )
+                        residual_actions = self.actor_critic.act_inference(residual_obs)
+                        actions = self.compose_actions(base_actions, residual_actions)
+
+                        next_obs, rews, dones, infos = self.vec_env.step(actions, id)
+                        current_obs.copy_(next_obs)
+
+                # Task fills successes at end of episode; accumulate counts
+                success_counts += self.vec_env.task.successes.float()
+
+                # Important: reset between episodes so task's eval_* buffers update correctly
+                current_obs = self.vec_env.reset()
+                current_states = self.vec_env.get_state()
+
+            avg_success = (success_counts / float(max(num_learning_iterations, 1))).mean()
+            print("success_rate:", avg_success.item())
+            return success_counts
             
         else:
             rewbuffer = deque(maxlen=100)

@@ -72,7 +72,8 @@ def train():
                 object_code = task.object_code_list[id]
                 object_scale = task.object_scale_buf[i]
                 key = object_code+"_"+str(object_scale)
-                rate = success_tensor[i].item()/200.0
+                # rate = success_tensor[i].item()/200.0
+                rate = success_tensor[i].item()/float(iterations)
                 average_success_rate += rate
                 success_rate[key] = rate 
 
