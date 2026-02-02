@@ -8,7 +8,7 @@ python train.py \
 --logdir=logs/1/0/test \
 --max_iterations=5000 \
 --num_envs=4096 \
-# --headless \
+--headless \
 # --model_dir=logs/test_seed0/model_5000.pt \
 # --test \
 # --model_dir=logs/test_seed0/drinking2.pt \

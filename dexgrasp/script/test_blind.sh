@@ -9,5 +9,5 @@ python train.py \
 --test \
 --num_envs=100 \
 --model_dir=checkpoints/base/4/0.pt \
-# --headless \
+--headless \
 

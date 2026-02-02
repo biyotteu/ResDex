@@ -12,4 +12,4 @@ python train.py \
 --base_obs_num=153 \
 --residual_obs_num=88 \
 --base_model_list_dir=4_means.yaml \
-# --headless \
+--headless \

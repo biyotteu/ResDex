@@ -12,5 +12,5 @@ python train.py \
 --test \
 --pointnet_dir=checkpoints/vision/pointnet_model.pt \
 --num_envs=1 \
-# --headless \
+--headless \
 # --num_envs=11000 \

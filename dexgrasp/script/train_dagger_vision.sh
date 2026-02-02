@@ -10,4 +10,4 @@ python train.py \
 --max_iteration=8000 \
 --vision \
 --backbone_type pn \
-# --headless \
+--headless \

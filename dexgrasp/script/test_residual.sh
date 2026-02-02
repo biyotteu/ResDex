@@ -12,7 +12,7 @@ python train.py \
 --residual_obs_num=88 \
 --test \
 --model_dir=checkpoints/res/4/state_model.pt \
-# --headless \
+--headless \
 # --save_test_traj \
 # --model_dir=logs/test_seed0/model_10000.pt \
 # --model_dir=model/MoE/with_objpos/fooditem_and_pencil.pt
