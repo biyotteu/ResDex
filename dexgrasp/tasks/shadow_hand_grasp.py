@@ -121,6 +121,56 @@ class ShadowHandGrasp(BaseTask):
 
         self.z_theta = torch.zeros(self.num_envs, device=self.device)
 
+        # ---------------------------------------------------------------------
+        # Init randomization for approach direction + pre-grasp templates
+        # ---------------------------------------------------------------------
+        env_cfg = self.cfg.get("env", {})
+
+        # position noise for hand start pose (in object frame)
+        self.init_hand_pos_noise_xy = float(env_cfg.get("initHandPosNoiseXY", 0.02))  # meters
+        self.init_hand_pos_noise_z  = float(env_cfg.get("initHandPosNoiseZ",  0.01))  # meters
+
+        # rotation noise for approach (roll/pitch) around mode base angles
+        self.init_rot_noise = float(env_cfg.get("initApproachRotNoise", 0.15))  # radians
+
+        # approach modes and probabilities
+        # modes define: (offset in object frame) + (base roll/pitch), yaw is still set by prior_rot_z
+        mode_names = env_cfg.get("initApproachModes", ["top", "side_x", "side_y", "diag"])
+        self._mode_probs = env_cfg.get("initApproachModeProbs", None)  # e.g. [0.7, 0.1, 0.1, 0.1]
+
+        offsets = []
+        euler_xy = []
+        for _m in mode_names:
+            if _m == "top":
+                offsets.append([0.00, 0.00, 0.12])   # above object
+                euler_xy.append([1.57, 0.00])        # roll=pi/2, pitch=0 (top-down)
+            elif _m == "side_x":
+                offsets.append([0.16, 0.00, 0.10])   # from +x side
+                euler_xy.append([0.00, 1.57])        # roll=0, pitch=pi/2
+            elif _m == "side_y":
+                offsets.append([0.00, 0.16, 0.10])   # from +y side
+                euler_xy.append([0.00, -1.57])       # roll=0, pitch=-pi/2
+            elif _m == "diag":
+                offsets.append([0.10, 0.10, 0.12])   # diagonal
+                euler_xy.append([1.10, 0.40])        # mild diagonal
+            else:
+                # fallback: top
+                offsets.append([0.00, 0.00, 0.12])
+                euler_xy.append([1.57, 0.00])
+
+        self._mode_offsets_obj = to_torch(offsets, dtype=torch.float, device=self.device)    # (M,3)
+        self._mode_euler_xy    = to_torch(euler_xy, dtype=torch.float, device=self.device)  # (M,2)
+
+        # Pre-grasp templates: interpolate(default_dof_pos -> target_qpos) with alpha
+        # alpha=0.0: default (open), alpha=1.0: close to target prior
+        self.pregrasp_alphas = env_cfg.get("initPregraspAlphas", [0.0, 0.35, 0.7])
+        self._pregrasp_probs = env_cfg.get("initPregraspAlphaProbs", None)  # e.g. [0.4, 0.4, 0.2]
+        self._pregrasp_alphas = to_torch(self.pregrasp_alphas, dtype=torch.float, device=self.device)
+
+        # --- extra eval metrics (only when cfg["env"]["collectEvalMetrics"]=True) ---
+        self.collect_eval_metrics = bool(env_cfg.get("collectEvalMetrics", False))
+        self.eval_min_hold_time_sec = float(env_cfg.get("evalMinHoldTimeSec", 1.0))
+        self._init_eval_metric_buffers()
         # create some wrapper tensors for different slices
         self.shadow_hand_default_dof_pos = torch.zeros(self.num_shadow_hand_dofs, dtype=torch.float, device=self.device)
         self.dof_state = gymtorch.wrap_tensor(dof_state_tensor)
@@ -152,6 +202,119 @@ class ShadowHandGrasp(BaseTask):
         self.apply_torque = torch.zeros((self.num_envs, self.num_bodies, 3), device=self.device, dtype=torch.float)
         self.total_successes = 0
         self.total_resets = 0
+
+    def _init_eval_metric_buffers(self):
+        # per-episode running
+        self._held_steps_cur = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+        self._held_steps_max = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+
+        self._prev_held = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        self._prev_rel_pos = torch.zeros(self.num_envs, 3, device=self.device, dtype=torch.float)
+        self._prev_rel_rot = torch.zeros(self.num_envs, 4, device=self.device, dtype=torch.float)
+
+        self._jlin_sq_sum = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
+        self._jang_sq_sum = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
+        self._jcnt = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+
+        self._jlin_peak = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
+        self._jang_peak = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
+
+        # per-env aggregations (accumulate across episodes, later aggregated per object/scale)
+        self.eval_episode_count = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+        self.eval_hold_time_max_sum = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
+        self.eval_jitter_lin_rms_sum = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
+        self.eval_jitter_ang_rms_sum = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
+        self.eval_jitter_lin_peak_sum = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
+        self.eval_jitter_ang_peak_sum = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
+        self.eval_stable_success_sum = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
+
+    def _quat_angle(self, q):
+        # q: (N,4) xyzw, return angle in rad
+        qn = q / torch.clamp(torch.norm(q, dim=-1, keepdim=True), min=1e-9)
+        sin_half = torch.clamp(torch.norm(qn[:, 0:3], dim=-1), max=1.0)
+        return 2.0 * torch.asin(sin_half)
+
+    def _eval_metrics_step(self):
+        # grasped definition consistent with reward inputs (palm+offset, fingertips already computed)
+        right_hand_dist = torch.norm(self.object_handle_pos - self.right_hand_pos, dim=-1)
+        right_hand_finger_dist = (
+            torch.norm(self.object_handle_pos - self.right_hand_ff_pos, dim=-1) +
+            torch.norm(self.object_handle_pos - self.right_hand_mf_pos, dim=-1) +
+            torch.norm(self.object_handle_pos - self.right_hand_rf_pos, dim=-1) +
+            torch.norm(self.object_handle_pos - self.right_hand_lf_pos, dim=-1) +
+            torch.norm(self.object_handle_pos - self.right_hand_th_pos, dim=-1)
+        )
+        grasped = (right_hand_finger_dist <= 0.6) & (right_hand_dist <= 0.12)
+
+        init_z = self.object_init_z.squeeze(-1) if self.object_init_z.dim() > 1 else self.object_init_z
+        lifted = self.object_pos[:, 2] > (init_z + 0.603)  # 0.6 + 0.003
+        held = grasped & lifted
+
+        # stability: track max consecutive held steps in this episode
+        self._held_steps_cur = torch.where(held, self._held_steps_cur + 1, torch.zeros_like(self._held_steps_cur))
+        self._held_steps_max = torch.maximum(self._held_steps_max, self._held_steps_cur)
+
+        # jitter: pose change of object in palm frame while held
+        palm_pos = self.right_hand_pos
+        palm_rot = self.right_hand_rot
+
+        rel_pos = quat_apply(quat_conjugate(palm_rot), self.object_pos - palm_pos)
+        rel_rot = quat_mul(quat_conjugate(palm_rot), self.object_rot)
+
+        # only compute delta when held both current and previous step
+        valid = held & self._prev_held
+        if valid.any():
+            dp = torch.norm(rel_pos[valid] - self._prev_rel_pos[valid], dim=-1) / self.dt  # m/s
+            dq = quat_mul(rel_rot[valid], quat_conjugate(self._prev_rel_rot[valid]))
+            dtheta = self._quat_angle(dq) / self.dt  # rad/s
+
+            self._jlin_sq_sum[valid] += dp * dp
+            self._jang_sq_sum[valid] += dtheta * dtheta
+            self._jcnt[valid] += 1
+            self._jlin_peak[valid] = torch.maximum(self._jlin_peak[valid], dp)
+            self._jang_peak[valid] = torch.maximum(self._jang_peak[valid], dtheta)
+
+        # update prev buffers
+        self._prev_rel_pos[held] = rel_pos[held]
+        self._prev_rel_rot[held] = rel_rot[held]
+        self._prev_held = held
+
+    def _eval_metrics_finalize(self, env_ids):
+        # avoid counting "empty" resets
+        valid_ep = self.progress_buf[env_ids] > 0
+        if valid_ep.numel() == 0 or not valid_ep.any():
+            return
+        eids = env_ids[valid_ep]
+
+        n = torch.clamp(self._jcnt[eids].to(torch.float), min=1.0)
+        jlin_rms = torch.sqrt(self._jlin_sq_sum[eids] / n)
+        jang_rms = torch.sqrt(self._jang_sq_sum[eids] / n)
+
+        hold_time_max = self._held_steps_max[eids].to(torch.float) * self.dt
+
+        # stable_success: success + held_time >= threshold
+        succ = (self.successes[eids] > 0.5)
+        stable = succ & (hold_time_max >= self.eval_min_hold_time_sec)
+
+        self.eval_episode_count[eids] += 1
+        self.eval_hold_time_max_sum[eids] += hold_time_max
+        self.eval_jitter_lin_rms_sum[eids] += jlin_rms
+        self.eval_jitter_ang_rms_sum[eids] += jang_rms
+        self.eval_jitter_lin_peak_sum[eids] += self._jlin_peak[eids]
+        self.eval_jitter_ang_peak_sum[eids] += self._jang_peak[eids]
+        self.eval_stable_success_sum[eids] += stable.to(torch.float)
+
+        # clear per-episode buffers for those envs
+        self._held_steps_cur[eids] = 0
+        self._held_steps_max[eids] = 0
+        self._prev_held[eids] = False
+        self._prev_rel_pos[eids] = 0
+        self._prev_rel_rot[eids] = 0
+        self._jlin_sq_sum[eids] = 0
+        self._jang_sq_sum[eids] = 0
+        self._jcnt[eids] = 0
+        self._jlin_peak[eids] = 0
+        self._jang_peak[eids] = 0
 
     def create_sim(self):
         self.dt = self.sim_params.dt
@@ -663,6 +826,8 @@ class ShadowHandGrasp(BaseTask):
         self.right_hand_th_rot = self.rigid_body_states[:, idx, 3:7]
         self.right_hand_th_pos = self.right_hand_th_pos + quat_apply(self.right_hand_th_rot,to_torch([0, 0, 1], device=self.device).repeat(self.num_envs, 1) * 0.02)
 
+        if getattr(self, "collect_eval_metrics", False):
+            self._eval_metrics_step()
         self.goal_pose = self.goal_states[:, 0:7]
         self.goal_pos = self.goal_states[:, 0:3]
         self.goal_rot = self.goal_states[:, 3:7]
@@ -838,6 +1003,10 @@ class ShadowHandGrasp(BaseTask):
 
     def reset(self, env_ids, goal_env_ids):
             
+        # finalize metrics for the episode that just ended (before we wipe successes/progress)
+        if getattr(self, "collect_eval_metrics", False):
+            self._eval_metrics_finalize(env_ids)
+
         # randomization can happen only at reset time, since it can reset actor positions on GPU
         if self.randomize:
             self.apply_randomizations(self.randomization_params)
@@ -870,9 +1039,32 @@ class ShadowHandGrasp(BaseTask):
         delta_min = self.shadow_hand_dof_lower_limits - self.shadow_hand_dof_default_pos
         rand_delta = delta_min + (delta_max - delta_min) * rand_floats[:, 5:5 + self.num_shadow_hand_dofs]
 
-        pos = self.shadow_hand_default_dof_pos  # + self.reset_dof_pos_noise * rand_delta
-        self.shadow_hand_dof_pos[env_ids, :] = pos
+                # -----------------------------------------------------------------
+        # DOF init: pre-grasp templates (default -> target) + noise
+        # -----------------------------------------------------------------
+        n = len(env_ids)
+        K = int(self._pregrasp_alphas.shape[0])
 
+        # sample alpha per env
+        if self._pregrasp_probs is not None:
+            p = torch.tensor(self._pregrasp_probs, device=self.device, dtype=torch.float)
+            p = p / torch.clamp(p.sum(), min=1e-8)
+            alpha_ids = torch.multinomial(p, n, replacement=True)
+        else:
+            alpha_ids = torch.randint(0, K, (n,), device=self.device)
+
+        alpha = self._pregrasp_alphas[alpha_ids].unsqueeze(-1)  # (n,1)
+
+        default = self.shadow_hand_default_dof_pos.unsqueeze(0)  # (1,D)
+        target  = self.target_qpos[env_ids, :]                   # (n,D)
+
+        pos = default + alpha * (target - default)
+        pos = pos + (self.reset_dof_pos_noise * rand_delta)
+
+        # clamp to limits
+        pos = tensor_clamp(pos, self.shadow_hand_dof_lower_limits, self.shadow_hand_dof_upper_limits)
+
+        self.shadow_hand_dof_pos[env_ids, :] = pos
         self.shadow_hand_dof_vel[env_ids, :] = self.shadow_hand_dof_default_vel + \
                                                self.reset_dof_vel_noise * rand_floats[:, 5 + self.num_shadow_hand_dofs:5 + self.num_shadow_hand_dofs * 2]
 
@@ -900,13 +1092,52 @@ class ShadowHandGrasp(BaseTask):
         prior_rot_z = get_euler_xyz(quat_mul(new_object_rot, self.target_hand_rot[env_ids]))[2]
 
         # coordinate transform according to theta(object)/ prior_rot_z(hand)
-        self.z_theta[env_ids] = prior_rot_z
-        prior_rot_quat = quat_from_euler_xyz(torch.tensor(1.57, device=self.device).repeat(len(env_ids), 1)[:, 0], torch.zeros_like(theta), prior_rot_z)
+                # -----------------------------------------------------------------
+        # Randomized hand start pose: approach modes + noise
+        # - orientation: (roll/pitch from mode + noise) + yaw(prior_rot_z)
+        # - position: object_pos + R_obj * offset_obj (+ noise)
+        # -----------------------------------------------------------------
+        n = len(env_ids)
+        M = int(self._mode_offsets_obj.shape[0])
 
-        self.hand_orientations[hand_indices.to(torch.long), :] = prior_rot_quat
-        self.hand_linvels[hand_indices.to(torch.long), :] = 0
-        self.hand_angvels[hand_indices.to(torch.long), :] = 0
+        # sample mode per env
+        if self._mode_probs is not None:
+            p = torch.tensor(self._mode_probs, device=self.device, dtype=torch.float)
+            p = p / torch.clamp(p.sum(), min=1e-8)
+            mode_ids = torch.multinomial(p, n, replacement=True)
+        else:
+            mode_ids = torch.randint(0, M, (n,), device=self.device)
 
+        base_off = self._mode_offsets_obj[mode_ids]  # (n,3)
+        base_xy  = self._mode_euler_xy[mode_ids]     # (n,2)
+
+        # noise in object frame
+        noise_xy = torch_rand_float(-1.0, 1.0, (n, 2), device=self.device) * self.init_hand_pos_noise_xy
+        noise_z  = torch_rand_float(-1.0, 1.0, (n, 1), device=self.device) * self.init_hand_pos_noise_z
+
+        off_obj = base_off.clone()
+        off_obj[:, 0:2] += noise_xy
+        off_obj[:, 2:3] += noise_z
+
+        # hand position in world = obj_pos + R_obj * off_obj
+        obj_pos = self.object_init_state[env_ids, 0:3]  # (n,3)
+        hand_pos = obj_pos + quat_apply(new_object_rot, off_obj)
+
+        # roll/pitch base + small noise, yaw = prior_rot_z
+        rot_noise_xy = torch_rand_float(-1.0, 1.0, (n, 2), device=self.device) * self.init_rot_noise
+        x = base_xy[:, 0] + rot_noise_xy[:, 0]
+        y = base_xy[:, 1] + rot_noise_xy[:, 1]
+        z = prior_rot_z
+
+        # coordinate transform according to theta(object)/ z(hand-yaw)
+        self.z_theta[env_ids] = z
+        hand_quat = quat_from_euler_xyz(x, y, z)
+
+        hi = hand_indices.to(torch.long)
+        self.hand_positions[hi, :] = hand_pos
+        self.hand_orientations[hi, :] = hand_quat
+        self.hand_linvels[hi, :] = 0
+        self.hand_angvels[hi, :] = 0
         # reset object
         self.root_state_tensor[self.object_indices[env_ids]] = self.object_init_state[env_ids].clone()
         self.root_state_tensor[self.object_indices[env_ids], 3:7] = new_object_rot  # reset object rotation
