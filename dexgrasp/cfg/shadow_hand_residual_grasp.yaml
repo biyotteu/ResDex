@@ -20,7 +20,8 @@ env:
   fallDistance: 0.4
   fallPenalty: 0.0
   forceLimitScale: 1.0
-  goal_cond: true 
+  # goal_cond: true 
+  goal_cond: false
   handAgentIndex: '[[0, 1, 2, 3, 4, 5]]'
   maxConsecutiveSuccesses: 0
   numEnvs: 4096
