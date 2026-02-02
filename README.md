@@ -26,6 +26,7 @@ Download Isaac Gym Preview 4 [here](https://developer.nvidia.com/isaac-gym-previ
 ### 4. Install dependencies:
 ```bash
 pip install -r requirements.txt
+pip install transforms3d trimesh ipdb addict yapf sorcery psutil pynvml
 ```
 
 ### 5. Install PointNet2:
