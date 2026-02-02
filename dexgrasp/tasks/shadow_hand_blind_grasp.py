@@ -101,6 +101,11 @@ class ShadowHandBlindGrasp(BaseTask):
 
         super().__init__(cfg=self.cfg, enable_camera_sensors=False)
 
+        # --- eval metrics (for PPO test_all_object) ---
+        self.collect_eval_metrics = bool(self.cfg.get("env", {}).get("collectEvalMetrics", False))
+        self.eval_min_hold_time_sec = float(self.cfg.get("env", {}).get("evalMinHoldTimeSec", 0.5))
+        self._init_eval_metric_buffers()  # always init so test.py can read buffers
+
         if self.viewer != None:
             cam_pos = gymapi.Vec3(10.0, 5.0, 1.0)
             cam_target = gymapi.Vec3(6.0, 5.0, 0.0)
@@ -157,6 +162,148 @@ class ShadowHandBlindGrasp(BaseTask):
         self.apply_torque = torch.zeros((self.num_envs, self.num_bodies, 3), device=self.device, dtype=torch.float)
         self.total_successes = 0
         self.total_resets = 0
+    
+    def _init_eval_metric_buffers(self):
+        """Buffers used to accumulate per-episode evaluation metrics (aggregated on reset)."""
+        self.eval_episode_count = torch.zeros(self.num_envs, device=self.device)
+        self.eval_hold_time_max_sum = torch.zeros(self.num_envs, device=self.device)
+        self.eval_jitter_lin_rms_sum = torch.zeros(self.num_envs, device=self.device)
+        self.eval_jitter_ang_rms_sum = torch.zeros(self.num_envs, device=self.device)
+        self.eval_jitter_lin_peak_sum = torch.zeros(self.num_envs, device=self.device)
+        self.eval_jitter_ang_peak_sum = torch.zeros(self.num_envs, device=self.device)
+        self.eval_stable_success_sum = torch.zeros(self.num_envs, device=self.device)
+    
+        # Per-episode running states
+        self._held_steps_cur = torch.zeros(self.num_envs, device=self.device)
+        self._hold_steps_max_cur = torch.zeros(self.num_envs, device=self.device)
+    
+        self._held_prev = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+    
+        self._last_obj_pos_palm = torch.zeros(self.num_envs, 3, device=self.device)
+        self._last_obj_rot_palm = torch.zeros(self.num_envs, 4, device=self.device)
+        self._has_last_obj_pose_palm = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+    
+        self._jitter_lin_sum_sq_cur = torch.zeros(self.num_envs, device=self.device)
+        self._jitter_ang_sum_sq_cur = torch.zeros(self.num_envs, device=self.device)
+        self._jitter_lin_peak_cur = torch.zeros(self.num_envs, device=self.device)
+        self._jitter_ang_peak_cur = torch.zeros(self.num_envs, device=self.device)
+    
+        self._jitter_sample_count_cur = torch.zeros(self.num_envs, device=self.device)
+    
+    def _quat_angle(self, q_rel):
+        """Return angle (rad) of a relative quaternion (wxyz assumed by IsaacGym utils in this codebase)."""
+        q_rel = q_rel / torch.clamp(torch.norm(q_rel, dim=-1, keepdim=True), min=1e-8)
+        w = torch.clamp(q_rel[..., 3], -1.0, 1.0)  # NOTE: many codebases use xyzw; adjust if your quat is wxyz/xyzw.
+        # If your quats are xyzw (common in IsaacGym torch_utils), w is last component -> OK.
+        return 2.0 * torch.acos(w)
+    
+    def _eval_metrics_step(self):
+        """Update per-step eval metrics for all envs (only meaningful during eval)."""
+        if not getattr(self, "collect_eval_metrics", False):
+            return
+    
+        # --- held condition (grasp + lift), mirroring reward thresholds ---
+        right_hand_dist = torch.norm(self.object_handle_pos - self.right_hand_pos, p=2, dim=-1)
+        right_hand_finger_dist = (
+            torch.norm(self.object_handle_pos - self.right_hand_ff_pos, p=2, dim=-1)
+            + torch.norm(self.object_handle_pos - self.right_hand_mf_pos, p=2, dim=-1)
+            + torch.norm(self.object_handle_pos - self.right_hand_rf_pos, p=2, dim=-1)
+            + torch.norm(self.object_handle_pos - self.right_hand_lf_pos, p=2, dim=-1)
+            + torch.norm(self.object_handle_pos - self.right_hand_th_pos, p=2, dim=-1)
+        )
+    
+        # lift threshold (same style as reward code: object_init_z + 0.6 + small epsilon)
+        lift_z = self.object_init_z[:, 0] + 0.6 + 0.003
+        obj_height_min = self.object_pos[:, 2]
+    
+        held = (right_hand_finger_dist <= 0.6) & (right_hand_dist <= 0.12) & (obj_height_min >= lift_z)
+    
+        # Hold time counting
+        held_steps = self._held_steps_cur
+        held_steps = torch.where(held, held_steps + 1.0, torch.zeros_like(held_steps))
+        self._held_steps_cur = held_steps
+        self._hold_steps_max_cur = torch.maximum(self._hold_steps_max_cur, held_steps)
+    
+        # --- jitter in palm frame while held ---
+        # object pose in palm frame
+        palm_rot = self.right_hand_rot
+        palm_pos = self.right_hand_pos
+    
+        obj_pos_palm = quat_apply(quat_conjugate(palm_rot), self.object_pos - palm_pos)
+        obj_rot_palm = quat_mul(quat_conjugate(palm_rot), self.object_rot)
+    
+        has_last = self._has_last_obj_pose_palm
+        valid = held & has_last
+    
+        dp = obj_pos_palm - self._last_obj_pos_palm
+        dt = float(self.dt) if not torch.is_tensor(self.dt) else float(self.dt.item())
+        dt = max(dt, 1e-8)
+        
+        lin_speed = torch.norm(dp, dim=-1) / dt
+    
+        dq = quat_mul(obj_rot_palm, quat_conjugate(self._last_obj_rot_palm))
+        ang = self._quat_angle(dq)
+        ang_speed = ang / dt 
+    
+        lin_speed = torch.where(valid, lin_speed, torch.zeros_like(lin_speed))
+        ang_speed = torch.where(valid, ang_speed, torch.zeros_like(ang_speed))
+    
+        self._jitter_lin_sum_sq_cur += lin_speed * lin_speed
+        self._jitter_ang_sum_sq_cur += ang_speed * ang_speed
+        self._jitter_lin_peak_cur = torch.maximum(self._jitter_lin_peak_cur, lin_speed)
+        self._jitter_ang_peak_cur = torch.maximum(self._jitter_ang_peak_cur, ang_speed)
+    
+        self._jitter_sample_count_cur += valid.float()
+    
+        # update last
+        self._last_obj_pos_palm = obj_pos_palm
+        self._last_obj_rot_palm = obj_rot_palm
+        self._has_last_obj_pose_palm = held.clone()
+    
+    def _eval_metrics_finalize(self, env_ids):
+        """Aggregate per-episode metrics into sums when an env resets."""
+        if not getattr(self, "collect_eval_metrics", False):
+            return
+        if env_ids.numel() == 0:
+            return
+    
+        e = env_ids.long()
+    
+        # episode count
+        self.eval_episode_count[e] += 1.0
+    
+        # max hold time in seconds
+        hold_time_max = self._hold_steps_max_cur[e] * self.dt
+        self.eval_hold_time_max_sum[e] += hold_time_max
+    
+        # stable success: held for >= threshold
+        stable = (hold_time_max >= float(getattr(self, "eval_min_hold_time_sec", 0.5))).float()
+        self.eval_stable_success_sum[e] += stable
+    
+        # jitter RMS/peak
+        cnt = torch.clamp(self._jitter_sample_count_cur[e], min=1.0)
+        lin_rms = torch.sqrt(self._jitter_lin_sum_sq_cur[e] / cnt)
+        ang_rms = torch.sqrt(self._jitter_ang_sum_sq_cur[e] / cnt)
+    
+        self.eval_jitter_lin_rms_sum[e] += lin_rms
+        self.eval_jitter_ang_rms_sum[e] += ang_rms
+        self.eval_jitter_lin_peak_sum[e] += self._jitter_lin_peak_cur[e]
+        self.eval_jitter_ang_peak_sum[e] += self._jitter_ang_peak_cur[e]
+    
+        # reset per-episode buffers for those envs
+        self._held_steps_cur[e] = 0.0
+        self._hold_steps_max_cur[e] = 0.0
+        self._held_prev[e] = False
+    
+        self._has_last_obj_pose_palm[e] = False
+        self._last_obj_pos_palm[e, :] = 0.0
+        self._last_obj_rot_palm[e, :] = 0.0
+    
+        self._jitter_lin_sum_sq_cur[e] = 0.0
+        self._jitter_ang_sum_sq_cur[e] = 0.0
+        self._jitter_lin_peak_cur[e] = 0.0
+        self._jitter_ang_peak_cur[e] = 0.0
+        self._jitter_sample_count_cur[e] = 0.0
 
     def create_sim(self):
         self.dt = self.sim_params.dt
@@ -669,6 +816,9 @@ class ShadowHandBlindGrasp(BaseTask):
         self.right_hand_th_rot = self.rigid_body_states[:, idx, 3:7]
         self.right_hand_th_pos = self.right_hand_th_pos + quat_apply(self.right_hand_th_rot,to_torch([0, 0, 1], device=self.device).repeat(self.num_envs, 1) * 0.02)
 
+        if getattr(self, "collect_eval_metrics", False):
+            self._eval_metrics_step()
+
         self.goal_pose = self.goal_states[:, 0:7]
         self.goal_pos = self.goal_states[:, 0:3]
         self.goal_rot = self.goal_states[:, 3:7]
@@ -863,7 +1013,10 @@ class ShadowHandBlindGrasp(BaseTask):
         self.reset_goal_buf[env_ids] = 0
 
     def reset(self, env_ids, goal_env_ids):
-            
+        # finalize eval metrics for episodes that are ending now
+        if getattr(self, "collect_eval_metrics", False):
+            self._eval_metrics_finalize(env_ids)
+                    
         # randomization can happen only at reset time, since it can reset actor positions on GPU
         if self.randomize:
             self.apply_randomizations(self.randomization_params)

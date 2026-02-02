@@ -19,6 +19,7 @@ from utils.process_sarl import *
 from utils.process_marl import process_MultiAgentRL, get_AgentIndex
 
 from tqdm import tqdm
+from collections import defaultdict
 
 def load_yaml(file_path):   
     with open(file_path, 'r') as stream:
@@ -42,6 +43,10 @@ def train():
     agent_index = get_AgentIndex(cfg)
 
     if args.algo in ["ppo", "dagger", "dagger_value", "residual"]:
+        if args.test_all_object:
+            if "env" not in cfg: cfg["env"] = {}
+            cfg["env"]["collectEvalMetrics"] = True
+
         task, env = parse_task(args, cfg, cfg_train, sim_params, agent_index)
 
         sarl = eval('process_{}'.format(args.algo))(args, env, cfg_train, logdir)
@@ -50,13 +55,15 @@ def train():
         if args.max_iterations > 0:
             iterations = args.max_iterations
         if args.test_all_object:
+            print("start test###################################################################")
             success_tensor = None
             success_tensor = sarl.run(num_learning_iterations=iterations, log_interval=cfg_train["learn"]["save_interval"])
             # for every entry of success_tensor, compute the final success rate
             # for each object
             # check if success_rate.yaml exists
             success_rate = {}
-           
+            extra_metrics = {}
+
             task = sarl.vec_env.task
             # print(success_tensor.tolist())
             average_success_rate = 0
@@ -69,8 +76,26 @@ def train():
                 average_success_rate += rate
                 success_rate[key] = rate 
 
+                # pull per-env aggregated metrics from task (filled during resets)
+                if hasattr(task, "eval_episode_count"):
+                    n = int(task.eval_episode_count[i].item())
+                    if n <= 0: n = 1
+                    extra_metrics[key] = {
+                        "episodes": int(task.eval_episode_count[i].item()),
+                        "hold_time_max_mean_sec": float((task.eval_hold_time_max_sum[i] / n).item()),
+                        "jitter_lin_rms_mean_mps": float((task.eval_jitter_lin_rms_sum[i] / n).item()),
+                        "jitter_ang_rms_mean_rps": float((task.eval_jitter_ang_rms_sum[i] / n).item()),
+                        "jitter_lin_peak_mean_mps": float((task.eval_jitter_lin_peak_sum[i] / n).item()),
+                        "jitter_ang_peak_mean_rps": float((task.eval_jitter_ang_peak_sum[i] / n).item()),
+                        "stable_success_rate": float((task.eval_stable_success_sum[i] / n).item()),
+                    }
+
             # save the result with the model name
-            save_yaml(args.model_dir + "_success_rate.yaml", success_rate)
+            print(args.logdir + "_success_rate.yaml")
+            save_yaml(args.logdir + "_success_rate.yaml", success_rate)
+            if len(extra_metrics) > 0:
+                save_yaml(args.logdir + "_extra_metrics.yaml", extra_metrics)
+
             # show how many objects have been tested
             print("Number of objects tested: ", len(success_rate.keys()))
             # calculate the average success rate
